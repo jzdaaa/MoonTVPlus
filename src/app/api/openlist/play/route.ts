@@ -4,8 +4,15 @@ import { NextRequest, NextResponse } from 'next/server';
 
 import { getAuthInfoFromCookie } from '@/lib/auth';
 import { getConfig } from '@/lib/config';
+import {
+  is115OpenListProvider,
+  resolveOpenListDirectPlayUrl,
+} from '@/lib/openlist-play-url';
+import {
+  createClientForSource,
+  resolveFolderSource,
+} from '@/lib/openlist-sources';
 import { requireFeaturePermission } from '@/lib/permissions';
-import { OpenListClient } from '@/lib/openlist.client';
 
 export const runtime = 'nodejs';
 
@@ -95,6 +102,32 @@ async function getFinalUrl(url: string, maxRedirects = 5): Promise<string> {
   }
 
   return currentUrl;
+}
+
+async function resolveDirectFilePlayUrl(
+  openListBaseUrl: string,
+  filePath: string,
+  file: { raw_url?: string; sign?: string; provider?: string },
+  unwrapRedirects: boolean
+): Promise<string> {
+  const playUrl = resolveOpenListDirectPlayUrl({
+    openListBaseUrl,
+    filePath,
+    rawUrl: file.raw_url,
+    sign: file.sign,
+    provider: file.provider,
+  });
+  if (!playUrl) {
+    throw new Error('获取到的播放链接为空');
+  }
+  if (
+    !unwrapRedirects ||
+    is115OpenListProvider(file.provider) ||
+    playUrl !== (file.raw_url || '').trim()
+  ) {
+    return playUrl;
+  }
+  return getFinalUrl(playUrl);
 }
 
 /**
@@ -194,12 +227,18 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'OpenList 未配置或未启用' }, { status: 400 });
     }
 
-    // folderName 已经是完整路径，直接使用
-    const folderPath = folderName;
+    // folderName 是完整路径，可能带「源名@」前缀，解析出源与真实路径
+    const resolved = resolveFolderSource(config, folderName);
+    if (!resolved) {
+      return NextResponse.json({ error: 'OpenList 未配置' }, { status: 400 });
+    }
+    const { source } = resolved;
+    const folderPath = resolved.path;
     const filePath = `${folderPath}/${fileName}`;
 
-    const { resolvePathMeta } = await import('@/lib/openlist-path-meta');
-    const pathMetaResolved = resolvePathMeta(
+    const { resolvePathMetaForSource } = await import('@/lib/openlist-path-meta');
+    const pathMetaResolved = resolvePathMetaForSource(
+      source.name,
       folderPath,
       openListConfig.PathMeta
     );
@@ -236,11 +275,7 @@ export async function GET(request: NextRequest) {
       return NextResponse.redirect(`${baseUrl}${proxyUrl}`);
     }
 
-    const client = new OpenListClient(
-      openListConfig.URL,
-      openListConfig.Username,
-      openListConfig.Password
-    );
+    const client = createClientForSource(source);
 
     // 如果启用了禁用预览视频，直接使用直连方法
     if (openListConfig.DisableVideoPreview) {
@@ -258,30 +293,23 @@ export async function GET(request: NextRequest) {
         );
       }
 
-      // 如果指定了 format=json，使用 getFinalUrl 并返回 JSON
+      const playUrl = await resolveDirectFilePlayUrl(
+        source.url,
+        filePath,
+        fileResponse.data,
+        format === 'json'
+      );
+
       if (format === 'json') {
-        const finalUrl = await getFinalUrl(fileResponse.data.raw_url);
-
-        // 检查URL是否为空
-        if (!finalUrl || finalUrl.trim() === '') {
-          throw new Error('获取到的播放链接为空');
-        }
-
         return NextResponse.json({
-          url: finalUrl,
-          mediaType: await detectOpenListMediaType(finalUrl),
+          url: playUrl,
+          mediaType: await detectOpenListMediaType(playUrl),
           refresh14m: pathMetaResolved.refresh14m,
           category: pathMetaResolved.category,
         });
       }
 
-      // 检查URL是否为空
-      if (!fileResponse.data.raw_url || fileResponse.data.raw_url.trim() === '') {
-        throw new Error('获取到的播放链接为空');
-      }
-
-      // 默认返回重定向（用于 tvbox）
-      return NextResponse.redirect(fileResponse.data.raw_url);
+      return NextResponse.redirect(playUrl);
     }
 
     // 优先尝试视频预览流方法
@@ -353,30 +381,23 @@ export async function GET(request: NextRequest) {
         );
       }
 
-      // 如果指定了 format=json，使用 getFinalUrl 并返回 JSON
+      const playUrl = await resolveDirectFilePlayUrl(
+        source.url,
+        filePath,
+        fileResponse.data,
+        format === 'json'
+      );
+
       if (format === 'json') {
-        const finalUrl = await getFinalUrl(fileResponse.data.raw_url);
-
-        // 检查URL是否为空
-        if (!finalUrl || finalUrl.trim() === '') {
-          throw new Error('获取到的播放链接为空');
-        }
-
         return NextResponse.json({
-          url: finalUrl,
-          mediaType: await detectOpenListMediaType(finalUrl),
+          url: playUrl,
+          mediaType: await detectOpenListMediaType(playUrl),
           refresh14m: pathMetaResolved.refresh14m,
           category: pathMetaResolved.category,
         });
       }
 
-      // 检查URL是否为空
-      if (!fileResponse.data.raw_url || fileResponse.data.raw_url.trim() === '') {
-        throw new Error('获取到的播放链接为空');
-      }
-
-      // 默认返回重定向（用于 tvbox）
-      return NextResponse.redirect(fileResponse.data.raw_url);
+      return NextResponse.redirect(playUrl);
     }
   } catch (error) {
     console.error('获取播放链接失败:', error);
